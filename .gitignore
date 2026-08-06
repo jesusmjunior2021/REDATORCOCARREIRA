@@ -1,0 +1,21 @@
+# Segredos — NUNCA commitar
+api_keys.json
+service_account.json
+*.credentials.json
+
+# Banco e saidas
+*.db
+*.db-wal
+*.db-shm
+saida/
+perfis/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Streamlit
+.streamlit/secrets.toml

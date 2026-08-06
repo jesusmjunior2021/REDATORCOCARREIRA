@@ -20,14 +20,83 @@ import json
 import time
 from pathlib import Path
 
+import os
+import sys
+
 import streamlit as st
 
-from core import editor as ed
-from core import exporters, gaps, ingest, kb as kbmod, parsing, pipeline, sheets
-from core.db import Banco, exportar_pacote_github
-from core.keys import KeyPool, PROVIDERS, ORDEM_PADRAO_INFERENCIA, TZ
+# --------------------------------------------------------------------------- #
+# BOOTSTRAP — garante que o pacote local `core` seja encontrado.
+# Em Streamlit Cloud, Docker e execucoes com cwd diferente, o diretorio do script
+# nem sempre entra no sys.path. Sem isto, `from core import ...` levanta
+# ModuleNotFoundError (que e subclasse de ImportError) e a Cloud censura a
+# mensagem, deixando so "ImportError" — sem dizer o que faltou.
+# --------------------------------------------------------------------------- #
 
 APP_DIR = Path(__file__).resolve().parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
+
+def _diagnostico(exc: BaseException) -> None:
+    """Mostra a causa real do erro de import, em vez da mensagem censurada."""
+    st.set_page_config(page_title="Redator — falha na inicialização",
+                       layout="wide", page_icon="⚠")
+    st.error(f"Falha ao carregar os módulos: **{type(exc).__name__}: {exc}**")
+
+    faltando = getattr(exc, "name", None)
+    if faltando and faltando != "core":
+        st.markdown(f"### Dependência ausente: `{faltando}`")
+        st.markdown("Acrescente ao `requirements.txt` e faça o redeploy:")
+        st.code(faltando, language="text")
+    elif faltando == "core":
+        st.markdown("### A pasta `core/` não está junto do `app.py`")
+        st.markdown(
+            "No repositório, `app.py`, `core/`, `kb/`, `requirements.txt` e "
+            "`schema.yml` precisam estar **na raiz** — não dentro de uma subpasta "
+            "`REDATOR_COCARREIRA/`. Se você subiu o zip inteiro, mova o conteúdo "
+            "da subpasta para a raiz e faça o commit.")
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**Ambiente**")
+        st.code(f"Python {sys.version.split()[0]}\n"
+                f"Diretório do app: {APP_DIR}\n"
+                f"Diretório atual:  {os.getcwd()}", language="text")
+        st.markdown("**sys.path**")
+        st.code("\n".join(sys.path[:8]), language="text")
+    with c2:
+        st.markdown("**Conteúdo do diretório do app**")
+        try:
+            itens = sorted(p.name + ("/" if p.is_dir() else "")
+                           for p in APP_DIR.iterdir())
+            st.code("\n".join(itens) or "(vazio)", language="text")
+        except OSError as e:
+            st.code(str(e))
+        st.markdown("**Conteúdo de core/**")
+        core_dir = APP_DIR / "core"
+        if core_dir.is_dir():
+            st.code("\n".join(sorted(p.name for p in core_dir.iterdir())),
+                    language="text")
+        else:
+            st.code("core/ NÃO EXISTE neste diretório", language="text")
+
+    with st.expander("Traceback completo"):
+        import traceback
+        st.code("".join(traceback.format_exception(exc)), language="text")
+    st.stop()
+
+
+try:
+    from core import editor as ed
+    from core import (exporters, gaps, ingest, kb as kbmod, parsing, pipeline,
+                      sheets)
+    from core.db import Banco, exportar_pacote_github
+    from core.keys import KeyPool, PROVIDERS, ORDEM_PADRAO_INFERENCIA, TZ
+except Exception as _exc:                                      # noqa: BLE001
+    _diagnostico(_exc)
+
 KB_DIR = APP_DIR / "kb"
 SAIDA_DIR = APP_DIR / "saida"
 ARQ_CHAVES = APP_DIR / "api_keys.json"

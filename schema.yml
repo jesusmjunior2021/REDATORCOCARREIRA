@@ -1,0 +1,504 @@
+# =============================================================================
+# schema.yml — CONTRATO ESTRUTURAL DO REDATOR COCARREIRA/CAEDNC
+# =============================================================================
+# Este arquivo e a fonte unica de verdade da estrutura usada pela aplicacao.
+# Serve para: (a) reimplementar a mesma estrutura em outra stack; (b) alimentar
+# um GEM/GPT/Claude com o formato esperado; (c) validar migracoes do SQLite.
+# =============================================================================
+
+meta:
+  projeto: Redator de Documentos Oficiais — COCARREIRA/CAEDNC
+  orgao: Tribunal de Justica do Estado do Maranhao
+  autor: Adm. Jesus Martins
+  versao: "3.1"
+  data: "2026-08-06"
+  fuso: America/Fortaleza
+  temperatura_inferencia: 0.2
+  top_p: 1.0
+
+# -----------------------------------------------------------------------------
+# 1. PIPELINE
+# -----------------------------------------------------------------------------
+pipeline:
+  etapas:
+    - id: 1
+      nome: extracao_dirigida
+      modulo: [core/gaps.py, core/parsing.py]
+      motor: llamaparse
+      fallback: [pdfplumber, python-docx, odt, texto]
+      entrada: [pdf, docx, odt, txt, md]
+      saida: [markdown_bruto, markdown_evidencias, dossie_md]
+      percentual: 10
+      nota: >
+        Quando o operador ja escolheu o modelo, os campos_obrigatorios desse .md
+        viram CAMPOS-ALVO. A parsing_instruction do LlamaParse e montada com eles,
+        o que muda o comportamento do OCR: preserva as regioes onde esses dados
+        costumam estar em vez de resumir. Depois, uma segunda passagem varre o
+        Markdown atras de cada alvo, devolvendo valor, pagina, trecho e confianca.
+      saidas_calculadas:
+        completude_por_documento: "campos supridos por aquele anexo / total de alvos"
+        completude_geral: "campos supridos por qualquer anexo / alvos exigiveis"
+        lacunas: "alvos nao supridos, excluidos os autopreenchiveis" 
+    - id: 2
+      nome: extracao_estruturada
+      modulo: core/pipeline.py::etapa_entidades
+      motor: [groq, cerebras, xai, gemini]
+      saida: json_entidades
+      percentual: 30
+    - id: 3
+      nome: classificacao
+      modulo: core/pipeline.py::etapa_classificar
+      pre_selecao: core/kb.py::pre_selecionar    # fuzzy, sem custo de token
+      motor: [groq, cerebras, xai, gemini]
+      saida: json_classificacao
+      percentual: 50
+    - id: 4
+      nome: redacao
+      modulo: core/pipeline.py::etapa_redigir
+      system_prompt: GEM_REDATOR_PROMPT.md
+      saida: texto_da_peca
+      percentual: 75
+    - id: 5
+      nome: persistencia_e_saida
+      modulo: [core/db.py, core/editor.py, core/exporters.py]
+      destinos: [sqlite, docx, google_docs, google_sheets, markdown]
+      percentual: 100
+
+# -----------------------------------------------------------------------------
+# 2. BANCO SQLITE3
+# -----------------------------------------------------------------------------
+banco:
+  arquivo: redator.db
+  engine: sqlite3
+  pragmas:
+    journal_mode: WAL
+    foreign_keys: ON
+  busca_textual: fts5            # documentos_fts; degrada para LIKE se indisponivel
+
+  tabelas:
+
+    documentos:
+      descricao: Peca gerada, versao corrente, com metadados de arquivamento.
+      chave_primaria: id
+      colunas:
+        id: {tipo: INTEGER, auto: true}
+        criado_em: {tipo: TEXT, formato: iso8601, obrigatorio: true}
+        atualizado_em: {tipo: TEXT, formato: iso8601, obrigatorio: true}
+        tipologia: {tipo: TEXT, obrigatorio: true, dominio: tipologias}
+        materia: {tipo: TEXT}
+        situacao: {tipo: TEXT}
+        modelos: {tipo: TEXT, formato: json_list, exemplo: '["MOD-REL-01"]'}
+        servidor: {tipo: TEXT}
+        matricula: {tipo: TEXT, indexado: true}
+        assunto: {tipo: TEXT, indexado: true}
+        processo: {tipo: TEXT}
+        cabecalho: {tipo: TEXT, formato: html}
+        rodape: {tipo: TEXT, formato: html}
+        corpo_html: {tipo: TEXT, obrigatorio: true, formato: html, origem: editor_quill}
+        corpo_texto: {tipo: TEXT, obrigatorio: true, uso: busca_e_fts}
+        campos_faltantes: {tipo: TEXT, formato: json_list}
+        entidades: {tipo: TEXT, formato: json_obj, origem: etapa_2}
+        classificacao: {tipo: TEXT, formato: json_obj, origem: etapa_3}
+        provedores: {tipo: TEXT, formato: json_list}
+        status: {tipo: TEXT, padrao: rascunho, dominio: [rascunho, revisado, expedido]}
+        versao_atual: {tipo: INTEGER, padrao: 1}
+        hash: {tipo: TEXT, algoritmo: sha256_16}
+        arquivo_nome: {tipo: TEXT}
+        drive_id: {tipo: TEXT}
+        drive_link: {tipo: TEXT}
+        docx_path: {tipo: TEXT}
+
+    versoes:
+      descricao: >
+        Historico completo de edicoes. Editar NUNCA sobrescreve: cria nova versao
+        e move o ponteiro documentos.versao_atual. Toda versao e recuperavel.
+      chave_primaria: id
+      chave_estrangeira: {documento_id: documentos.id, on_delete: CASCADE}
+      colunas:
+        versao: {tipo: INTEGER, obrigatorio: true}
+        criado_em: {tipo: TEXT, formato: iso8601}
+        corpo_html: {tipo: TEXT, obrigatorio: true}
+        corpo_texto: {tipo: TEXT, obrigatorio: true}
+        cabecalho: {tipo: TEXT}
+        rodape: {tipo: TEXT}
+        autor: {tipo: TEXT, padrao: operador}
+        nota: {tipo: TEXT, exemplo: "edicao no editor"}
+        hash: {tipo: TEXT}
+
+    kb_arquivos:
+      descricao: >
+        Base de conhecimento internalizada. Inclui os .md nativos e os PDFs
+        convertidos pelo LlamaParse. Espelha kb/ e permite versionar no GitHub.
+      chave_primaria: id
+      unicos: [identificador, caminho]
+      colunas:
+        identificador: {tipo: TEXT, exemplo: "MOD-REL-01"}
+        caminho: {tipo: TEXT, exemplo: "02_BASE_GERAL_DOCUMENTOS/MOD_REL_01_....md"}
+        base: {tipo: TEXT, dominio: bases}
+        tipologia: {tipo: TEXT}
+        materia: {tipo: TEXT}
+        situacao: {tipo: TEXT}
+        origem: {tipo: TEXT, dominio: [manual, llamaparse, pdfplumber, python-docx, odt, upload_md]}
+        arquivo_fonte: {tipo: TEXT, exemplo: "RESOLUCAO_533_2024_CNJ.pdf"}
+        conteudo_md: {tipo: TEXT, obrigatorio: true}
+        frontmatter: {tipo: TEXT, formato: json_obj}
+        ativo: {tipo: INTEGER, padrao: 1, nota: "0 remove do contexto sem apagar"}
+        hash: {tipo: TEXT}
+
+    anexos:
+      descricao: Material bruto extraido pelo LlamaParse, vinculado ao documento.
+      chave_estrangeira: {documento_id: documentos.id, on_delete: CASCADE}
+      colunas:
+        nome: {tipo: TEXT, obrigatorio: true}
+        origem: {tipo: TEXT}
+        paginas: {tipo: INTEGER, padrao: 0}
+        markdown: {tipo: TEXT, limite_chars: 400000}
+        erro: {tipo: TEXT}
+
+    servidores:
+      descricao: Cadastro derivado dos documentos; base do perfil e do intersticio.
+      chave_primaria: matricula
+      colunas:
+        nome: {tipo: TEXT}
+        cargo: {tipo: TEXT}
+        unidade: {tipo: TEXT}
+        atualizado_em: {tipo: TEXT}
+        observacoes: {tipo: TEXT}
+
+    eventos:
+      descricao: Log tecnico do pipeline — provedor, duracao, erro.
+      colunas:
+        etapa: {tipo: TEXT}
+        provedor: {tipo: TEXT}
+        duracao_seg: {tipo: REAL}
+        detalhe: {tipo: TEXT, limite_chars: 4000}
+        nivel: {tipo: TEXT, padrao: info, dominio: [info, aviso, erro]}
+
+    config:
+      descricao: Pares chave/valor da aplicacao (caminho do SA, IDs do Drive).
+      chave_primaria: chave
+      colunas:
+        valor: {tipo: TEXT, formato: json}
+
+# -----------------------------------------------------------------------------
+# 3. FRONTMATTER DOS .MD DA BASE DE CONHECIMENTO
+# -----------------------------------------------------------------------------
+kb_frontmatter:
+  formato: yaml_entre_tracos_triplos
+  campos:
+    id: {obrigatorio: true, exemplo: "MOD-REL-01"}
+    tipologia:
+      obrigatorio: false
+      nota: "Presenca deste campo marca o arquivo como MODELO REDIGIVEL."
+      dominio: tipologias
+    tipo:
+      obrigatorio: false
+      nota: "Marca arquivo de apoio SEMPRE presente no contexto do LLM."
+      dominio: [norma, logica_de_classificacao, regras_operacionais, dicionario_de_dados, referencia, perfil_de_servidor]
+    materia: {exemplo: "Relotacao"}
+    evento: {nota: "Alternativa a materia, usada no Auxilio-Bolsa"}
+    situacao: {exemplo: "Anuencia OK + certidao PAD negativa"}
+    par: {nota: "ID da peca-par; resolvido automaticamente", exemplo: "MOD-AB-06"}
+    campos_obrigatorios: {formato: lista, exemplo: "[NOME, MATRICULA, CARGO]"}
+    palavras_chave: {formato: lista, limite: 8}
+    normas_citadas: {formato: lista}
+    origem_drive: {nota: "Rastreabilidade do modelo original"}
+    origem: {nota: "manual | llamaparse | upload_md"}
+    arquivo_fonte: {nota: "PDF de origem, quando ingerido"}
+
+  corpo:
+    convencao: >
+      O texto do modelo vai dentro de cerca de codigo tripla. Cada campo a
+      preencher aparece como {NOME_DO_CAMPO} em CAIXA_ALTA. Secoes explicativas
+      ficam FORA da cerca, sob titulos "## NOTA DE USO" ou "## VARIANTE".
+
+  bases:
+    - id: "01_BASE_RH_AUXILIO_BOLSA"
+      escopo: "Assistente de RH, Auxilio-Bolsa, TJMA"
+    - id: "02_BASE_GERAL_DOCUMENTOS"
+      escopo: "Toda a producao documental da COCARREIRA"
+
+# -----------------------------------------------------------------------------
+# 4. DOMINIOS
+# -----------------------------------------------------------------------------
+dominios:
+  tipologias: [INFORMACAO, DESPACHO, OFICIO, MEMORANDO, MANIFESTACAO, REQUERIMENTO]
+  status_documento: [rascunho, revisado, expedido]
+  naturezas_kb: [modelo, norma, logica, referencia]
+
+# -----------------------------------------------------------------------------
+# 5. CAMPOS CANONICOS DAS PECAS
+# -----------------------------------------------------------------------------
+campos_canonicos:
+  regra_de_ouro: >
+    Campo marcado como nao inferivel que nao venha no caso concreto NUNCA e
+    preenchido por suposicao. Grava-se literalmente [DADO FALTANTE: <campo>].
+
+  identificacao_servidor:
+    NOME: {tipo: texto, fonte: "Requerimento / MentoRH", inferivel: false}
+    MATRICULA: {tipo: numero, fonte: MentoRH, inferivel: false}
+    CARGO: {tipo: texto, fonte: MentoRH, inferivel: false}
+    UNIDADE_ORIGEM: {tipo: texto, fonte: MentoRH, inferivel: false}
+    UNIDADE_DESTINO: {tipo: texto, fonte: Requerimento, inferivel: false}
+
+  identificacao_processo:
+    NUM_PROCESSO: {formato: "NNNNN/AAAA", fonte: DigiDoc, inferivel: false}
+    NUM_MANIF: {formato: "NNNN/AAAA", inferivel: false}
+    NUM_INFORMA: {formato: "NNNNAAAA", inferivel: false}
+    COD_VALIDACAO: {formato: hex, inferivel: false}
+    ID_MOVIMENTACAO: {tipo: numero, inferivel: false}
+    NUM_DECISAO: {formato: "NNNNAAAA", inferivel: false}
+    OFC_REFERENCIA: {formato: "SIGLA-NNNNAAAA", inferivel: false}
+    DATA: {formato: por_extenso, inferivel: true, fonte: sistema}
+
+  auxilio_bolsa:
+    EDITAL: {formato: "EDT-GDG NNN/AAAA", inferivel: false}
+    CURSO: {inferivel: false}
+    IES: {inferivel: false}
+    MODALIDADE: {inferivel: false}
+    PERIODO_CURSO: {inferivel: false}
+    VLR_CONTRATADO: {tipo: moeda, inferivel: false}
+    VLR_PAGO: {tipo: moeda, inferivel: false}
+    VLR_70PCT:
+      tipo: moeda
+      calculado: true
+      formula: "ARREDONDA(VLR_PAGO * 0.70, 2)"
+      limite: "teto da PORTARIA-GP 1045/2022"
+    VLR_PAGO_ANTERIOR: {tipo: moeda, inferivel: false}
+    VLR_PAGO_NOVO: {tipo: moeda, inferivel: false}
+    VLR_BRUTO_ANTIGO: {tipo: moeda, inferivel: false}
+    VLR_BRUTO_NOVO: {tipo: moeda, inferivel: false}
+    VLR_70PCT_NOVO: {tipo: moeda, calculado: true, formula: "ARREDONDA(VLR_PAGO_NOVO * 0.70, 2)"}
+    MES_REAJUSTE: {formato: "mes/ano", inferivel: false}
+    PERIODO_MESES: {exemplo: "janeiro a junho de 2026", inferivel: true}
+    LINHAS_POR_MES: {tipo: tabela, inferivel: false}
+
+# -----------------------------------------------------------------------------
+# 6. TRAVAS DE SEGURANCA JURIDICA
+# -----------------------------------------------------------------------------
+travas:
+  regra: >
+    Se qualquer trava estiver 'violado' ou 'pendente', a classificacao devolve
+    opinar_pelo_deferimento=false e a peca vira remessa para diligencia.
+  itens:
+    - id: intersticio_6_meses
+      norma: "art. 4o, par. unico, RESOL-GP-232010 c/ RESOL-GP-472011"
+      aplica_a: [relotacao, remocao_a_pedido, permuta]
+    - id: intersticio_2_anos
+      norma: "art. 1o, par. unico, RESOL-GP-432019"
+      aplica_a: [remocao_a_pedido, permuta]
+    - id: certidao_pad
+      fonte: "Coordenadoria de PAD e Sindicancia"
+    - id: anuencia_chefias
+      norma: "§ 1o do art. 3o, RESOL-GP-232010"
+    - id: impacto_primeiro_grau
+      norma: "RESOL-GP-192023 / CNJ 194 e 219"
+
+# -----------------------------------------------------------------------------
+# 7. EDITOR
+# -----------------------------------------------------------------------------
+editor:
+  motor: streamlit-quill            # Quill.js — WYSIWYG
+  formato_trabalho: html
+  conversores:
+    texto_para_html: core/editor.py::texto_para_html
+    html_para_texto: core/editor.py::html_para_texto
+    html_para_docx: core/editor.py::html_para_docx
+  recursos:
+    - negrito
+    - italico
+    - sublinhado
+    - tachado
+    - alinhamento: [esquerda, centro, direita, justificado]
+    - recuo: {incremento_cm: 1.25}
+    - listas: [ordenada, marcadores]
+    - titulos: [h1, h2, h3]
+    - cor_e_realce
+    - citacao
+    - tabelas
+  pagina:
+    fonte: Times New Roman
+    tamanho_pt: 12
+    margem_sup_cm: 3.0
+    margem_inf_cm: 2.0
+    margem_esq_cm: 3.0
+    margem_dir_cm: 2.0
+    entrelinhas: 1.5
+    espaco_depois_pt: 6
+    recuo_primeira_linha_cm: 1.25
+  cabecalho_rodape:
+    editaveis: true
+    formato: html
+    vao_para: "secao header/footer do .docx"
+
+# -----------------------------------------------------------------------------
+# 8. PROVEDORES DE API
+# -----------------------------------------------------------------------------
+provedores:
+  arquivo_chaves: api_keys.json
+  formato: '{provedor: [{key, label, status, usos, cooldown_until, ultimo_erro}]}'
+  rodizio:
+    criterio: "chave ativa de menor contador de uso (round-robin balanceado)"
+    cota_429_402: {acao: cooldown, segundos: 900}
+    rejeicao_401_403: {acao: marcar_invalida}
+    provedor_esgotado: {acao: saltar_para_proximo}
+  ordem_padrao_inferencia: [groq, cerebras, xai, gemini]
+  itens:
+    llamaparse:
+      papel: parsing
+      base: "https://api.cloud.llamaindex.ai/api/v1"
+      fluxo: ["POST /parsing/upload", "GET /parsing/job/{id}", "GET /parsing/job/{id}/result/markdown"]
+    groq:
+      papel: inferencia
+      chat: "https://api.groq.com/openai/v1/chat/completions"
+      modelos: [llama-3.3-70b-versatile, openai/gpt-oss-120b, llama-3.1-8b-instant]
+    cerebras:
+      papel: inferencia
+      chat: "https://api.cerebras.ai/v1/chat/completions"
+      modelos: [llama-3.3-70b, qwen-3-235b-a22b-instruct-2507, llama3.1-8b]
+    xai:
+      papel: inferencia
+      chat: "https://api.x.ai/v1/chat/completions"
+      modelos: [grok-4, grok-3-mini]
+    gemini:
+      papel: inferencia
+      chat: "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
+      modelos: [gemini-2.5-flash, gemini-2.5-pro]
+  aviso: >
+    Endpoints e nomes de modelo mudam com frequencia. Conferir contra a
+    documentacao vigente de cada provedor antes de producao.
+
+# -----------------------------------------------------------------------------
+# 9. GOOGLE WORKSPACE
+# -----------------------------------------------------------------------------
+google:
+  autenticacao: service_account
+  arquivo: service_account.json
+  escopos:
+    - "https://www.googleapis.com/auth/drive"
+    - "https://www.googleapis.com/auth/spreadsheets"
+  apis_necessarias: [Drive API, Sheets API]
+  pre_requisito: >
+    Compartilhar a pasta-raiz e a planilha com o e-mail da Service Account,
+    com permissao de Editor.
+  drive:
+    pasta_servidor: "{MATRICULA} - {NOME COMPLETO}"
+    arquivo: "{MATRICULA}_{NOME}_{ASSUNTO}_{TIPOLOGIA}_{AAAA-MM-DD}"
+    mime_destino: "application/vnd.google-apps.document"
+    comportamento: "cria a pasta se nao existir; reaproveita se existir"
+  sheets:
+    aba: Documentos
+    cabecalho: [data_hora, tipologia, modelos, servidor, matricula, assunto,
+                processo, arquivo, link, campos_faltantes, provedores, hash]
+    criacao_cabecalho: automatica
+
+# -----------------------------------------------------------------------------
+# 10. ARVORE DE ARQUIVOS
+# -----------------------------------------------------------------------------
+arvore:
+  app.py: "Interface Streamlit — 5 abas"
+  cli.py: "Execucao headless e lote"
+  schema.yml: "Este arquivo"
+  requirements.txt: null
+  GEM_REDATOR_PROMPT.md: "System prompt da etapa 4; portavel para GEM/GPT/Claude"
+  redator.db: "SQLite3 — gerado na primeira execucao"
+  api_keys.json: "Pool de chaves — gerado ao cadastrar a primeira"
+  core/:
+    keys.py: "Pool, rodizio, cooldown, import/export"
+    parsing.py: "LlamaParse + fallbacks locais"
+    llm.py: "Cliente unico com rodizio de provedor"
+    kb.py: "Carga dos .md, fuzzy, montagem de contexto"
+    pipeline.py: "Orquestracao das etapas 1 a 4"
+    editor.py: "HTML <-> texto <-> docx, CSS da folha A4"
+    gaps.py: "Extracao dirigida aos campos-alvo, completude, evidencias .md"
+    sheets.py: "Planilha-banco no Drive: cria, alimenta e le"
+    db.py: "Persistencia SQLite3"
+    ingest.py: "PDF -> LlamaParse -> .md -> banco"
+    exporters.py: "Google Docs, Sheets, nomenclatura"
+  kb/:
+    01_BASE_RH_AUXILIO_BOLSA/: "11 arquivos"
+    02_BASE_GERAL_DOCUMENTOS/: "23 arquivos"
+  saida/: "docx gerados"
+
+# -----------------------------------------------------------------------------
+# 11. INVARIANTES — nao violar em nenhuma reimplementacao
+# -----------------------------------------------------------------------------
+invariantes:
+  - "Nunca inventar nome, matricula, valor, edital, processo, portaria ou numeracao."
+  - "Campo ausente vira literalmente [DADO FALTANTE: <campo>]."
+  - "Editar cria nova versao; nenhuma versao anterior e perdida."
+  - "Peca-par e resolvida automaticamente (MANIFESTACAO+OFICIO, INFORMACAO+DESPACHO)."
+  - "Trava pendente impede opinar pelo deferimento."
+  - "A ordem dos paragrafos do modelo nunca e alterada."
+  - "Todo valor e calculado e resolvido; formula nunca aparece na peca."
+  - "Documentos de producao nao sao anonimizados; exemplos da base, sim."
+
+# -----------------------------------------------------------------------------
+# 12. EXTRACAO DIRIGIDA (core/gaps.py)
+# -----------------------------------------------------------------------------
+extracao_dirigida:
+  alvos:
+    fonte: "frontmatter campos_obrigatorios dos modelos escolhidos"
+    exclui: [VLR_70PCT, VLR_70PCT_NOVO]      # calculados pela aplicacao
+    autopreenchiveis: [DATA, DATA_OFICIO]    # nao contam como lacuna
+
+  achado:
+    campo: str
+    valor: "literal, como grafado no documento; null se ausente"
+    pagina: "numero indicado por <!-- pagina N -->"
+    trecho: "ate 200 chars em volta, para auditoria"
+    confianca: "0.0 a 1.0"
+    fonte: "nome do anexo"
+
+  consolidacao:
+    regra: "maior confianca vence entre anexos"
+    precedencia: "valor informado pelo operador sobrepoe o extraido (confianca 1.0)"
+
+  artefatos_md:
+    DOSSIE.md: "consolidado: campos localizados, lacunas, completude por documento"
+    EVID_<anexo>.md: "por anexo: tabela de achados, trechos e tabelas integrais"
+    destino: "saida/evidencias/ — commitavel no GitHub"
+
+  regras_do_extrator:
+    - "NUNCA deduza"
+    - "NUNCA calcule"
+    - "NUNCA complete com conhecimento externo"
+    - "copie o que esta escrito"
+
+# -----------------------------------------------------------------------------
+# 13. PLANILHA-BANCO NO DRIVE (core/sheets.py)
+# -----------------------------------------------------------------------------
+planilha:
+  titulo_padrao: "BASE DE DOCUMENTOS — COCARREIRA/CAEDNC"
+  criacao: "botao 'Criar planilha no Drive'; garantir() nao duplica existente"
+  local: "dentro da pasta-raiz configurada"
+  locale: pt_BR
+  fuso: America/Fortaleza
+  abas:
+    Documentos:
+      colunas: [data_hora, doc_id, tipologia, materia, modelos, servidor,
+                matricula, assunto, processo, status, versao, completude_%,
+                campos_faltantes, arquivo, link_drive, provedores, hash]
+      alimentacao: "uma linha por peca enviada ao Drive"
+    Servidores:
+      colunas: [matricula, nome, cargo, unidade, qtd_documentos,
+                ultima_movimentacao, atualizado_em, observacoes]
+      alimentacao: "reescrita a partir do SQLite, sob demanda"
+    Lacunas:
+      colunas: [data_hora, doc_id, servidor, matricula, campo, pista,
+                resolvido_por, observacao]
+      alimentacao: "uma linha por campo faltante da peca"
+  leitura: "sheets.ler_aba() — a planilha e consultavel como banco"
+
+# -----------------------------------------------------------------------------
+# 14. PACOTE GITHUB (core/db.py::exportar_pacote_github)
+# -----------------------------------------------------------------------------
+pacote_github:
+  conteudo:
+    - "kb/**/*.md — todos os modelos ativos"
+    - "kb/INDEX.md — tabela navegavel de ID, tipologia, materia, situacao, origem"
+    - "kb/catalogo.json — catalogo legivel por maquina"
+    - ".gitignore — protege chaves, .db e saida/"
+    - "documentos/*.md — opcional, pecas produzidas com frontmatter"
+  protegidos_pelo_gitignore:
+    [api_keys.json, service_account.json, "*.db", "saida/", "__pycache__/"]

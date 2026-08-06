@@ -30,6 +30,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import gaps
 from . import kb as kbmod
 from . import llm
 from . import parsing
@@ -59,6 +60,9 @@ class ResultadoPipeline:
     modelos_usados: list[str] = field(default_factory=list)
     campos_faltantes: list[str] = field(default_factory=list)
     extracoes: list[parsing.ParseResult] = field(default_factory=list)
+    dossie: "gaps.Dossie | None" = None
+    completude: float = 0.0
+    alvos: list[str] = field(default_factory=list)
     trilha: list[str] = field(default_factory=list)
     provedores: list[str] = field(default_factory=list)
 
@@ -313,16 +317,42 @@ def executar(pool: KeyPool, docs: list[kbmod.Documento], relato: str,
              prompt_mestre: Path | None = None,
              instrucao_parse: str = parsing.INSTRUCAO_PADRAO,
              instrucoes_extra: str = "",
+             conhecidos: dict[str, str] | None = None,
              progresso=None) -> ResultadoPipeline:
     """Roda o fluxo inteiro. `progresso(pct, msg)` e opcional."""
     res = ResultadoPipeline()
 
-    # 1 — parsing
-    extracoes, material = etapa_parse(pool, anexos or [], instrucao_parse, progresso)
-    res.extracoes = extracoes
-    res.trilha.append(
-        f"[1] LlamaParse: {len(extracoes)} anexo(s) — "
-        f"{', '.join(sorted({e.origem for e in extracoes})) or 'nenhum'}")
+    # 1 — parsing. Se o operador ja indicou o modelo, a extracao e DIRIGIDA
+    #     aos campos-alvo desse modelo (caca as lacunas).
+    alvos: list[str] = []
+    if modelos_forcados:
+        alvos = gaps.alvos_do_modelo(docs, kbmod.resolver_pares(docs, modelos_forcados))
+        res.alvos = alvos
+
+    if alvos and anexos:
+        d = kbmod.por_id(docs, modelos_forcados[0])
+        dossie = gaps.levantar(
+            pool, anexos, alvos,
+            tipologia=(d.tipologia if d else ""), materia=(d.materia if d else ""),
+            ordem=ordem_inferencia, conhecidos=conhecidos, progresso=progresso)
+        res.dossie = dossie
+        res.completude = dossie.completude
+        res.extracoes = [parsing.ParseResult(
+            nome=x.nome, markdown=x.markdown_bruto, origem=x.origem,
+            paginas=x.paginas, erro=x.erro) for x in dossie.documentos]
+        material = (dossie.markdown() + "\n\n" +
+                    "\n\n".join(x.markdown_evidencias for x in dossie.documentos))
+        res.trilha.append(
+            f"[1] Extracao DIRIGIDA a {len(alvos)} campo(s)-alvo — "
+            f"completude {dossie.completude}% — lacunas: "
+            f"{', '.join(dossie.lacunas) or 'nenhuma'}")
+    else:
+        extracoes, material = etapa_parse(pool, anexos or [], instrucao_parse,
+                                          progresso)
+        res.extracoes = extracoes
+        res.trilha.append(
+            f"[1] LlamaParse: {len(extracoes)} anexo(s) — "
+            f"{', '.join(sorted({e.origem for e in extracoes})) or 'nenhum'}")
 
     # 2 — entidades
     entidades, prov2 = etapa_entidades(pool, relato, material, ordem_inferencia, progresso)
@@ -355,9 +385,15 @@ def executar(pool: KeyPool, docs: list[kbmod.Documento], relato: str,
     res.modelos_usados = classificacao.get("modelos", [])
 
     # 4 — redacao
+    extra = instrucoes_extra
+    if res.dossie:
+        extra += ("\n8. O DOSSIE DE EVIDENCIAS no material traz os campos ja "
+                  "localizados nos anexos, com fonte e pagina. Use esses valores "
+                  "literalmente. Os campos listados em LACUNAS nao existem nos "
+                  "anexos: gere [DADO FALTANTE: <campo>] para cada um deles.")
     texto, prov4 = etapa_redigir(pool, docs, relato, entidades, classificacao,
                                  material, prompt_mestre, ordem_inferencia,
-                                 instrucoes_extra, progresso)
+                                 extra, progresso)
     res.documento = texto
     res.provedores.append(prov4)
     res.trilha.append(f"[4] Redacao via {prov4}")
